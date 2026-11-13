@@ -10,13 +10,31 @@
  */
 
 /** Shape of the raw error body returned by the MercadoPago API. */
-interface ApiErrorBody {
-    status?: number;
-    message?: string;
-    error?: string;
-    cause?: unknown[];
-    [key: string]: unknown;
+interface ApiOrderErrorItem {
+	code?: string;
+	message?: string;
+	details?: string[];
+	[key: string]: unknown;
 }
+
+interface ApiErrorBody {
+	status?: number;
+	message?: string;
+	error?: string;
+	cause?: unknown[];
+	errors?: ApiOrderErrorItem[];
+	[key: string]: unknown;
+}
+
+interface NormalizedErrorBody {
+	status: number;
+	message: string;
+	error: string;
+	causes: unknown[];
+}
+
+const nonEmptyString = (value: unknown): string | undefined =>
+	typeof value === "string" && value.trim().length > 0 ? value : undefined;
 
 /**
  * Base class for all MercadoPago API errors.
@@ -31,29 +49,60 @@ export class MercadoPagoError extends Error {
 	readonly causes: unknown[];
 
 	constructor(body: ApiErrorBody | null | undefined) {
-		const safeBody = body ?? {};
-		const message = typeof safeBody.message === 'string' && safeBody.message.trim().length > 0
-			? safeBody.message
+		const normalized = MercadoPagoError.normalizeBody(body);
+
+		super(normalized.message);
+
+		this.name = this.constructor.name;
+		this.status = normalized.status;
+		this.error = normalized.error;
+		this.causes = normalized.causes;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+
+	private static nonEmptyString(value: unknown): string | undefined {
+		return typeof value === "string" && value.trim().length > 0
+			? value
 			: undefined;
-		let errorValue = message;
+	}
+
+	private static normalizeBody(
+		body: ApiErrorBody | null | undefined,
+	): NormalizedErrorBody {
+		const safeBody = body ?? {};
+		const status = safeBody.status ?? 0;
+		const firstOrderError = Array.isArray(safeBody.errors)
+			? safeBody.errors[0]
+			: undefined;
+
+		const message =
+			MercadoPagoError.nonEmptyString(safeBody.message) ??
+			MercadoPagoError.nonEmptyString(firstOrderError?.message);
+
+		let errorValue =
+			MercadoPagoError.nonEmptyString(safeBody.error) ?? MercadoPagoError.nonEmptyString(firstOrderError?.code) ?? message;
+
 		if (!errorValue) {
 			try {
-				const serializedBody = JSON.stringify(safeBody);
-				if (serializedBody && serializedBody !== '{}') errorValue = serializedBody;
+				const serialized = JSON.stringify(safeBody);
+				if (serialized && serialized !== "{}") errorValue = serialized;
 			} catch {
-				// Fall back to the HTTP status when the body cannot be serialized.
-				errorValue = `HTTP ${safeBody.status ?? 0}`;
+				errorValue = `HTTP ${status}`;
 			}
 		}
-		errorValue = errorValue || `HTTP ${safeBody.status ?? 0}`;
 
-		super(errorValue);
-		this.name = this.constructor.name;
-		this.status = safeBody.status ?? 0;
-		this.error = errorValue;
-		this.causes = safeBody.cause ?? [];
-		// Maintain prototype chain in compiled JavaScript
-		Object.setPrototypeOf(this, new.target.prototype);
+		const causes = Array.isArray(safeBody.cause)
+			? safeBody.cause
+			: Array.isArray(safeBody.errors)
+				? safeBody.errors
+				: [];
+
+		return {
+			status,
+			message: message || `HTTP ${safeBody.status ?? 0}`,
+			error: errorValue || `HTTP ${safeBody.status ?? 0}`,
+			causes,
+		};
 	}
 }
 
@@ -107,23 +156,24 @@ export class MPServerError extends MercadoPagoError {}
 export class MPConnectionError extends MercadoPagoError {
 	constructor(cause: unknown) {
 		const msg = cause instanceof Error ? cause.message : String(cause);
-		super({ message: msg, error: 'connection_error' });
+		super({ message: msg, error: "connection_error" });
 		this.__cause__ = cause;
 	}
 	private __cause__: unknown;
 }
 
-const STATUS_MAP: Record<number, new (body: ApiErrorBody) => MercadoPagoError> = {
-	400: MPBadRequestError,
-	401: MPAuthenticationError,
-	402: MPPaymentError,
-	403: MPForbiddenError,
-	404: MPNotFoundError,
-	409: MPIdempotencyError,
-	422: MPValidationError,
-	423: MPResourceLockedError,
-	424: MPDependencyError,
-};
+const STATUS_MAP: Record<number, new (body: ApiErrorBody) => MercadoPagoError> =
+	{
+		400: MPBadRequestError,
+		401: MPAuthenticationError,
+		402: MPPaymentError,
+		403: MPForbiddenError,
+		404: MPNotFoundError,
+		409: MPIdempotencyError,
+		422: MPValidationError,
+		423: MPResourceLockedError,
+		424: MPDependencyError,
+	};
 
 /**
  * Factory: maps an HTTP status code to the most specific error subtype.
@@ -132,8 +182,13 @@ const STATUS_MAP: Record<number, new (body: ApiErrorBody) => MercadoPagoError> =
  * @param body        Parsed API error body.
  * @param retryAfter  Seconds from the `Retry-After` header (only for 429).
  */
-export function buildError(status: number, body: ApiErrorBody, retryAfter: number | null = null): MercadoPagoError {
-	if (status === 429) return new MPRateLimitError({ ...body, status }, retryAfter);
+export function buildError(
+	status: number,
+	body: ApiErrorBody,
+	retryAfter: number | null = null,
+): MercadoPagoError {
+	if (status === 429)
+		return new MPRateLimitError({ ...body, status }, retryAfter);
 	const Cls = STATUS_MAP[status];
 	if (Cls) return new Cls({ ...body, status });
 	if (status >= 500) return new MPServerError({ ...body, status });
